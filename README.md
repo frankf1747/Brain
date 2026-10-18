@@ -1,143 +1,96 @@
 # brain
 
-A personal knowledge base you can talk to from any Claude chat.
+**A personal knowledge base that turns what I collect over time into context that I, and the AI tools I work with, can actually use.**
 
-You save anything: notes, pasted articles, job posts, conversations. The brain keeps the text, makes it searchable by meaning and by keyword, and builds a graph of the people, companies and projects it mentions, plus a list of facts about you. When you ask a question, it returns the passages that answer it, says how strong the evidence is, and can check an answer against the sources it cites.
+## Why this exists
 
-```mermaid
-flowchart TB
-    you(["You, in a Claude chat or the command line"])
-    you -- "save this" --> ingest["<b>Save</b><br/>store, chunk, summarize,<br/>embed, extract a graph"]
-    you -- "ask" --> search["<b>Search</b><br/>five layers, one evidence contract"]
-    ingest --> db[("<b>Postgres + pgvector</b><br/>documents · passages · graph · facts · logs")]
-    db --> search
-    db --> obsidian["<b>Obsidian vault</b><br/>read-only mirror"]
-    search -- "passages, facts,<br/>evidence level" --> answer(["An answer with [P1] [F1] citations"])
-    answer -- "its claims" --> verify["<b>Verify</b><br/>check each claim against its sources"]
-```
+Good ideas rarely come from one place. They show up when something I read last month meets a problem I am working on today, or when a thought clicks and needs catching before it is gone. That material is scattered: notes, saved articles, class slides, job posts, conversations, half-formed thoughts. Each piece lives in a different app, so the connections between them are never made, and every AI chat starts from zero.
 
-- **Nothing is lost.** The raw text is always kept, so even when the smarter layers miss, a literal scan can still find an exact code or figure.
-- **Every answer is traceable.** Each passage and fact has an id you can open. Each search is logged and can be replayed.
-- **Facts about you come only from your own words.** A saved article by someone else never becomes a fact about you.
-- **Costs are capped.** Embedding calls are metered against a hard daily token cap.
+Brain is where all of it goes. It keeps everything, finds the people, companies, projects and ideas the pieces share, and connects them across domains. When an idea sparks, the depth to make it real is already there.
 
-Design doc: `docs/superpowers/specs/2026-09-27-knowledge-base-core-design.md`.
+## The mission
 
-**Contents:** [How it works](#how-it-works) · [Setup](#setup) · [Using it](#using-it) · [Reading a search result](#reading-a-search-result) · [Reference](#reference)
+Make accumulated context **usable and trustworthy**, for me and for any AI assistant I work with.
 
----
+- **Usable.** One place to save anything, from any Claude chat or the command line. One question finds the answer whether I remember the exact words or only the idea.
+- **Connected.** Every saved document feeds a graph of people, organizations, projects and concepts, and a list of facts about me. A question about a company also brings back the people I know there and the notes that mention it.
+- **Trustworthy.** An assistant that answers from my own notes must not invent things about me. Every passage and fact carries a citation that can be opened. Every search says how strong its evidence is, and says so when the knowledge base may not hold the answer. Answers can be checked claim by claim against their sources.
+- **Mine.** It runs on my own machine and database. Facts about me come only from things I wrote, never from an article I saved. Spending on external services is capped per day.
+
+## What I use it for
+
+- **Learning.** Saving lecture slides, articles and posts around the point I want to keep, so the lesson comes back when a related question comes up later.
+- **Projects and work.** Capstone plans, internship write-ups, decisions and who owns what, so a new chat can pick up a project without being re-briefed.
+- **Applications.** Experience, skills, figures and stories in one place, so a resume or a cover letter draws on verified facts instead of memory.
+- **People and organizations.** Who I met, where they work, and what we discussed, linked to every note that mentions them.
+
+In practice it looks like this: in any Claude chat I say "save this to my brain", or ask "what did I learn about prediction models?", and the chat calls the brain's tools, answers from my own material, and cites it.
 
 ## How it works
 
-### 1. Saving a document
+The brain does three things: it **saves** what I give it, **answers** questions from it, and **checks** answers against their sources. Everything lives in one Postgres database, with a read-only copy in my Obsidian vault for browsing.
 
-When you save something, the brain answers as soon as the text is stored and split into passages. The rest runs in the background, one stage at a time. A document's stage is recorded, so an interrupted document picks up where it stopped.
+### Saving
+
+Saving returns as soon as the text is stored and split into passages. The rest runs in the background, one stage at a time, and an interrupted document picks up where it stopped.
 
 ```mermaid
 flowchart TB
     A["<b>stored</b> · raw text kept"] --> B["<b>chunked</b> · sections and passages"]
-    B -. "brain_ingest returns here" .-> R(["you get the document id"])
-    B --> C["<b>summarized</b> · Claude writes a title and summary"]
-    C --> D["<b>embedded</b> · Voyage vectors for each passage and the summary"]
-    D --> E["<b>extracted</b> · Claude reads each section: entities, relations, facts"]
-    E --> F["<b>resolved</b> · entities matched to existing graph nodes"]
-    F --> G(["done"])
+    B --> C["<b>summarized</b> · title and summary"]
+    C --> D["<b>embedded</b> · vectors for search"]
+    D --> E["<b>extracted</b> · entities, relations, facts"]
+    E --> F["<b>resolved</b> · linked into the graph"]
     classDef bg fill:#eef3ff,stroke:#7a8cc2,color:#1a1a1a
     class C,D,E,F bg
 ```
 
-Blue stages run in the background.
+The first two stages happen while you wait; the blue ones run in the background.
 
 | Stage | What happens | Calls |
 |---|---|---|
-| stored | The raw text, its kind (note, news, job_description…), author, date and origin are saved. | none |
-| chunked | Split into **sections** (~1,500 tokens, used for extraction) and **passages** (~400 tokens with 15% overlap, used for search), on markdown headings and sentence boundaries. Each passage keeps its heading path. | none |
+| stored | The raw text is kept with its kind (note, news, job_description…), author, date and origin. Nothing is ever lost: even when every smarter layer misses, a literal scan can still find an exact code or figure. | none |
+| chunked | Split on markdown headings and sentence boundaries into **sections** (~1,500 tokens), which the extractor reads, and **passages** (~400 tokens, 15% overlap), which search returns. Each passage keeps its heading path. | none |
 | summarized | A title, a one-line summary and a longer summary. | Claude |
-| embedded | Each passage is embedded with a short context prefix (document title, summary line and heading path), and so is the summary. | Voyage |
-| extracted | People, organizations, places, projects, events, artifacts and concepts; relations between them; facts about you, each with a verbatim quote. | Claude, once per section |
-| resolved | Each entity is matched to an existing node or creates one; relations become edges and facts are written, each pointing at the passage that supports it. | Voyage (entity names) |
+| embedded | Each passage is embedded together with a short context line (document title, summary line and heading path), and so is the summary. | Voyage |
+| extracted | People, organizations, places, projects, events, artifacts and concepts; the relations between them; facts about me. Each comes with a verbatim quote. | Claude, once per section |
+| resolved | Each entity is matched to an existing node or creates one. Relations become edges and facts are written, each pointing at the passage that supports it. | Voyage (entity names) |
 
-```mermaid
-flowchart TB
-    doc["Document"] --> s1["Section 1<br/>~1,500 tokens"] & s2["Section 2"]
-    s1 --> p1["Passage<br/>~400 tokens"] & p2["Passage"] & p3["Passage"]
-    s2 --> p4["Passage"] & p5["Passage"]
-    s1 -. "read by the extractor" .-> x(["entities, relations, facts"])
-    p2 -. "embedded and indexed" .-> q(["what search returns"])
-```
+**Who wrote it decides what becomes a fact.** Every document records its author: `owner`, `other` or `unknown`. Only documents I wrote produce facts about me. Notes, pastes, conversations and resumes default to `owner`; news, papers, job descriptions and emails to `other`. For facts that hold one value at a time, such as where I live or my visa status, a newer statement supersedes the older one, and a value I set by hand always wins. Details are under [Facts and authorship](#facts-and-authorship).
 
-At most 2 documents process in the background at once, so a slot stays free for new saves. If the process running a document exits partway, `brain_status` lists it as stalled and resumes it (see [Pipeline and stalls](#pipeline-and-stalls)).
+### Answering
 
-### 2. Asking a question
-
-Every search runs five layers and returns one structure, the **evidence contract**. That same structure is what the model reads, what you read, and what is logged.
+Every search runs five layers at once and returns one structure, the **evidence contract**. The same structure is what the model reads, what I read, and what is logged, so any search can be replayed later.
 
 ```mermaid
 flowchart LR
-    Q(["Your<br/>question"]) --> layers
+    Q(["question"]) --> layers
     subgraph layers["Five layers"]
         direction TB
-        L1["<b>1. Hybrid passages</b><br/>vector + keyword, fused, then reranked"]
-        L2["<b>2. Document summaries</b><br/>the same two branches"]
-        L3["<b>3. Graph expansion</b><br/>entities named in the question, and their neighbours"]
-        L4["<b>4. Facts about you</b><br/>sharing a term or pointing at a named entity"]
-        L5["<b>5. Literal scan</b><br/>exact codes and figures, only when the rest is weak"]
+        L1["<b>1. Hybrid passages</b><br/>vector + keyword, fused, reranked"]
+        L2["<b>2. Document summaries</b>"]
+        L3["<b>3. Graph</b><br/>entities named in the question, and their neighbours"]
+        L4["<b>4. Facts about me</b>"]
+        L5["<b>5. Literal scan</b><br/>exact codes and figures, when the rest is weak"]
         L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5
     end
-    layers --> C["<b>Evidence contract</b><br/>retrieval id · mode<br/>scores · how found<br/>author · evidence level"]
-    C --> M["shown to the<br/>model and to you"]
-    C --> LOG[("retrieval_log")]
-    LOG --> EX["brain_explain<br/>replays the ranking"]
-    LOG --> VF["brain_verify<br/>checks an answer"]
+    layers --> C["<b>Evidence contract</b><br/>passages and facts with ids,<br/>scores, how each was found,<br/>who wrote it, evidence level"]
+    C --> M(["shown to the model"])
+    C --> LOG[("logged, replayable")]
 ```
 
-Layer 1 is where most answers come from:
+- **Most answers come from layer 1.** Vector search (by meaning) and keyword search (by stems of the text, headings and title) each return up to 60 candidates. They are merged with reciprocal rank fusion and reranked, giving each passage a relevance score from 0 to 1.
+- **Weak evidence is flagged.** When the best score is below 0.56, the result says the knowledge base may not hold the answer. On held-out test questions this flag never fired on an answerable question. It catches every off-topic question, but only some "near-miss" questions that ask for a detail the notes never state (see [Abstention](#abstention)).
+- **Degraded searches say so.** If the embedding or the reranker is unavailable, the search falls back to keyword-only or fused order, and the result states it.
+- **No model ranks or judges.** Ranking is Postgres plus Voyage. Claude is called only to summarize and extract at save time, to write answers in `brain ask`, and to draft eval questions.
 
-```mermaid
-flowchart LR
-    q(["question"]) --> v["Vector search<br/>HNSW over Voyage<br/>embeddings, top 60"]
-    q --> k["Keyword search<br/>GIN index over stems of<br/>text, headings and title, top 60"]
-    v & k --> f["Reciprocal rank<br/>fusion (k = 60)"]
-    f --> r["Voyage reranker<br/>score 0 to 1"]
-    r --> t{"best score<br/>≥ 0.56?"}
-    t -- yes --> s(["evidence: strong"])
-    t -- no --> w(["evidence: weak<br/>the base may not<br/>hold the answer"])
-```
+### Checking
 
-If the query embedding fails or the daily cap refuses it, the search falls back to keyword-only. If the rerank fails, results keep their fused order. Either way, the result says so.
+After a model answers, it can send its claims, each with the `[P1]`/`[F1]` labels it cites, to `brain_verify`. Each claim is compared only with the text it cites: its content words, every number, date and code, negation, and words like up/down or before/after. The verdict is `supported`, `partial`, `unsupported`, `uncited` (the model's own statement) or `bad_citation`.
 
-No model ranks results or checks answers. Ranking is Postgres plus Voyage; checking is Postgres stemming plus fixed rules. Claude is called only to summarize and extract at save time, to write answers in `brain ask`, and to draft eval questions.
+It checks **vocabulary, not logic**. "Supported" means the cited text contains the claim's words and numbers, not that the claim is true: a swapped entity or a reversed relation can pass. The rules, a worked example and every known limit are in [Answer checking](#answer-checking).
 
-### 3. Checking an answer
-
-After a model answers from a search, it can pass its claims, each with the `[P1]`/`[F1]` labels it cites, to `brain_verify`. Each claim is checked only against what it cites.
-
-```mermaid
-flowchart LR
-    claim(["Claim + its cites"]) --> c{"Any cites?"}
-    c -- no --> U["uncited<br/><i>the model's own</i>"]
-    c -- "cites nothing<br/>in that search" --> B["bad_citation"]
-    c -- yes --> chk["Compare with the cited text:<br/>content words · numbers, dates, codes ·<br/>negation · polarity words"]
-    chk --> S["supported<br/>≥ 60% of words, all numbers,<br/>negation agrees"]
-    chk --> P["partial<br/>≥ 30%, or one check fails"]
-    chk --> N["unsupported<br/>< 30%"]
-```
-
-It checks **vocabulary, not logic**. "Supported" means the cited text contains the claim's words and numbers, not that the claim is true. A swapped entity or a reversed relation can pass. Every rule and every known limit is listed in [Answer checking](#answer-checking).
-
-### 4. Who wrote it decides what becomes a fact
-
-```mermaid
-flowchart LR
-    d(["Saved document"]) --> a{"author?"}
-    a -- owner --> yes["Facts about you and<br/>relations from you<br/>are written"]
-    a -- "other / unknown" --> no["Kept in the stored extraction<br/>but not written,<br/>and counted in brain_status"]
-    yes --> sv{"single-valued fact?<br/>lives_in, visa_status,<br/>current_employer…"}
-    sv -- yes --> sup["The newer value supersedes<br/>the older one; a value you set<br/>by hand always wins"]
-    sv -- no --> add["Added alongside<br/>existing facts"]
-```
-
-Notes, pastes, conversations and resumes default to `owner`. News, papers, job descriptions and emails default to `other`. Pass `author: "other"` when you save someone else's writing as a note.
+**Contents:** [Setup](#setup) · [Using it](#using-it) · [Reading a search result](#reading-a-search-result) · [Reference](#reference) · Design doc: `docs/superpowers/specs/2026-09-27-knowledge-base-core-design.md`
 
 ---
 
@@ -166,19 +119,6 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/<file>
 
 ### From a Claude chat (MCP)
 
-```mermaid
-flowchart LR
-    subgraph mac["Your Mac"]
-        cc["Claude Code"] -- stdio --> s1["brain MCP server"]
-        cd["Claude Desktop"] -- stdio --> s1
-        s1 --> db[("local Postgres")]
-    end
-    subgraph remote["Optional: hosted"]
-        web["claude.ai, ChatGPT,<br/>phone"] -- "HTTPS +<br/>bearer token" --> s2["brain MCP server<br/>(Fly.io)"]
-        s2 --> sdb[("hosted Supabase")]
-    end
-```
-
 **Claude Code.** Register once at user scope, so every chat gets the `brain_*` tools:
 
 ```bash
@@ -187,7 +127,9 @@ claude mcp add --scope user --transport stdio brain -- /Users/frankfu/Documents/
 
 Say "save this to my brain" in any chat to save something. Ask anything, and the model calls `brain_search` when it needs your material. The stdio server stops when Claude Code closes it.
 
-**Other clients (HTTP).** See [Hosting the server](#hosting-the-server).
+**Claude Desktop.** Add the same server to Desktop's `claude_desktop_config.json` while the app is closed (it overwrites the file when it saves its own settings). Use Node's absolute path as the command, since the Desktop app does not see your shell's `PATH`.
+
+**claude.ai on the web, a phone, ChatGPT.** These cannot reach a database on your Mac. See [Hosting the server](#hosting-the-server).
 
 **The eleven tools:**
 
@@ -429,14 +371,6 @@ A claim labelled `supported` is always one its cited text really supports, and a
 
 ### Voyage spending cap
 
-```mermaid
-flowchart LR
-    req(["Voyage request"]) --> est["Estimate tokens<br/>characters ÷ 4"]
-    est --> chk{"today's total +<br/>estimate > cap?"}
-    chk -- yes --> refuse["Refused, never sent<br/>search: keyword-only<br/>ingest: stops before embedding"]
-    chk -- no --> send["Sent"] --> rec["Record Voyage's<br/>real token count"]
-```
-
 Every Voyage request (passage and summary embeddings, entity-name embeddings during resolve, query embeddings, reranking) is recorded in `brain.provider_usage` and counted against a hard daily cap: `BRAIN_VOYAGE_DAILY_TOKEN_CAP` tokens per UTC day, default 5,000,000.
 - **Before each request,** the client reserves its estimated tokens (characters / 4) under a database lock. It refuses the request without sending it when today's total plus the estimate would pass the cap.
 - **After the response,** it records Voyage's own `usage.total_tokens`. A request Voyage answers with an error status is recorded at 0 tokens. A request that times out, or whose connection drops, counts at its estimate, since Voyage may have processed and billed it. A retry is a request of its own.
@@ -544,15 +478,6 @@ The retrieval eval runs only against databases whose names end in `_eval`. Each 
 - Each item has a question, its kind (keyword, semantic, graph, filter, fallback, attribution, negative), the expected documents with an optional verbatim answer quote, optional paraphrases, its source (`fixture`, `generated`, `captured`) and who approved it.
 
 Items come from three places:
-
-```mermaid
-flowchart LR
-    fx["fixture<br/>written with the corpus"] --> G[("golden set")]
-    dr["eval draft<br/>Claude proposes 2–3<br/>questions per document"] --> auto{"automatic checks:<br/>quote verbatim, in one passage,<br/>not a duplicate, valid schema"}
-    auto -- pass --> sheet["review sheet<br/>owner marks keep,<br/>edit or reject"]
-    sheet -- "eval approve<br/>(re-checks)" --> G
-    cap["eval capture<br/>recent real searches"] --> lab["eval label<br/>owner names the<br/>expected document"] --> G
-```
 
 - `fixture`: written with the corpus, labelled `approved_by: "agent"`.
 - `generated`: `npm run brain -- eval draft` makes one Claude call per document for 2 to 3 questions across kinds, each with a verbatim answer quote and two paraphrases, plus one question nothing in the corpus answers. Every draft is checked automatically:
@@ -677,13 +602,6 @@ A relevance score cannot tell "about the right thing" from "states the answer"; 
 The answers, the evidence level of each search and the verifier's verdicts are in `eval/ask/2026-10-04-heldout.jsonl`. Whether each answer declined or answered was judged by an agent reading it (`judged_by`), and `scripts/eval-ask.ts` reruns it. This is one run of one model on 40 items of a fictional corpus, with model output that varies between runs: evidence that the safeguard works, not a rate to quote. It is not part of the gate, which makes no model call.
 
 ### Obsidian
-
-```mermaid
-flowchart LR
-    save(["save"]) --> db[("database<br/>the retrieval layer")]
-    db -- "debounced refresh<br/>a few seconds after<br/>the last save" --> vault["Obsidian vault<br/>Brain/ folder<br/>read-only mirror"]
-    vault --> gv["Obsidian graph view"]
-```
 
 Every save writes twice: to the database, which is the retrieval layer, and to a read-only markdown mirror in your Obsidian vault, which is there for reading and for Obsidian's graph view. The vault and folder come from `OBSIDIAN_VAULT_PATH` and `OBSIDIAN_FOLDER`. The mirror only flows one way: edits made in Obsidian never reach the database.
 
